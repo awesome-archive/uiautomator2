@@ -15,12 +15,13 @@ import requests
 import six
 from retry import retry
 
-from uiautomator2.exceptions import (NullPointerExceptionError,
-                                     UiObjectNotFoundError)
-from uiautomator2.utils import Exists, U, check_alive, hooks_wrap, intersect
+from uiautomator2.exceptions import (RetryError, NullPointerExceptionError,
+                                     UiObjectNotFoundError,
+                                     UiautomatorQuitError)
+from uiautomator2.utils import Exists, U, check_alive, hooks_wrap, intersect, cache_return
+from uiautomator2.swipe import SwipeExt
 
 _INPUT_METHOD_RE = re.compile(r'mCurMethodId=([-_./\w]+)')
-
 _fail_prompt_enabled = False
 
 
@@ -79,27 +80,59 @@ class Session(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
+    def _update_pid(self, pid: int):
+        """ Update package running pid """
+        self._pid = pid
+        jsonrpc_url = self.server.path2url('/session/%d:%s/jsonrpc/0' %
+                                           (pid, self._pkg_name))
+        self._jsonrpc = self.server.setup_jsonrpc(jsonrpc_url)
+
     @property
-    def xpath(self):
-        return self.server.xpath
-    
+    @cache_return
+    def widget(self):
+        from uiautomator2.widget import Widget
+        return Widget(self)
+
     @property
-    def shell(self):
-        return self.server.shell
+    @cache_return
+    def swipe_ext(self):
+        return SwipeExt(self.server)
 
     def implicitly_wait(self, seconds=None):
         """set default wait timeout
         Args:
             seconds(float): to wait element show up
+
+        Deprecated:
+            recommend use: d.settings['wait_timeout'] = 10
         """
-        if seconds is not None:
-            self.server.wait_timeout = seconds
-        return self.server.wait_timeout
+        if seconds is None:
+            return self.server.settings['wait_timeout']
+        else:
+            self.server.settings["wait_timeout"] = seconds
+
+        # if seconds is not None:
+        #     self.server.wait_timeout = seconds
+        # return self.server.wait_timeout
 
     def close(self):
         """ close app """
         if self._pkg_name:
             self.server.app_stop(self._pkg_name)
+
+    def restart(self, use_monkey=False):
+        """
+        Stop app and start
+
+        Raises:
+            RuntimeError
+        """
+        self.close()
+        self.server.app_start(self._pkg_name, use_monkey=use_monkey)
+        pid = self.server.app_wait(self._pkg_name, timeout=3)
+        if not pid:
+            raise RuntimeError("app start failed")
+        self._update_pid(pid)
 
     def running(self):
         """
@@ -325,8 +358,8 @@ class Session(object):
             def move(self, x, y):
                 obj.jsonrpc.injectInputEvent(ACTION_MOVE, x, y, 0)
 
-            def up(self, x=0, y=0):
-                """ ACTION_UP x, y seems no use """
+            def up(self, x, y):
+                """ ACTION_UP x, y """
                 obj.jsonrpc.injectInputEvent(ACTION_UP, x, y, 0)
 
         return _Touch()
@@ -440,6 +473,9 @@ class Session(object):
             screenshot().save("saved.png")
             cv2.imwrite('saved.jpg', screenshot(format='opencv'))
         """
+        # Another way to take screenshot is use jsonrpc
+        # self.jsonrpc.takeScreenshot(1.0, 70) # scale, quality -> base64
+
         r = requests.get(self.server.screenshot_uri, timeout=10)
         if filename:
             with open(filename, 'wb') as f:
@@ -448,7 +484,7 @@ class Session(object):
         elif format == 'pillow':
             from PIL import Image
             buff = io.BytesIO(r.content)
-            return Image.open(buff)
+            return Image.open(buff).convert("RGB")
         elif format == 'opencv':
             import cv2
             import numpy as np
@@ -459,6 +495,7 @@ class Session(object):
         else:
             raise RuntimeError("Invalid format " + format)
 
+    @retry(RetryError, delay=1.0, tries=2)
     def dump_hierarchy(self, compressed=False, pretty=False) -> str:
         """
         Args:
@@ -469,14 +506,12 @@ class Session(object):
             content = self.jsonrpc.dumpWindowHierarchy(compressed, None)
         But through GET /dump/hierarchy will be more robust
         when dumpHierarchy fails, the atx-agent will restart uiautomator again, then retry
+
+        v-1.3.4 change back to jsonrpc.dumpWindowHierarchy
         """
-        res = self.server._reqsess.get(self.server.path2url("/dump/hierarchy"))
-        try:
-            res.raise_for_status()
-        except requests.HTTPError:
-            logging.warning("request error: %s", res.text)
-            raise
-        content = res.json().get("result")
+        content = self.jsonrpc.dumpWindowHierarchy(compressed, None)
+        if content == "":
+            raise RetryError("dump hierarchy is empty")
 
         if pretty and "\n " not in content:
             xml_text = xml.dom.minidom.parseString(content.encode("utf-8"))
@@ -545,87 +580,49 @@ class Session(object):
     def exists(self, **kwargs):
         return self(**kwargs).exists
 
-    def watcher(self, name):
-        obj = self
-
-        class Watcher(object):
-            def __init__(self):
-                self.__selectors = []
-
-            @property
-            def triggered(self):
-                return obj.server.jsonrpc.hasWatcherTriggered(name)
-
-            def remove(self):
-                obj.server.jsonrpc.removeWatcher(name)
-
-            def when(self, **kwargs):
-                self.__selectors.append(Selector(**kwargs))
-                return self
-
-            def click(self, **kwargs):
-                target = Selector(**kwargs) if kwargs else self.__selectors[-1]
-                obj.server.jsonrpc.registerClickUiObjectWatcher(
-                    name, self.__selectors, target)
-
-            def press(self, *keys):
-                """
-                key (str): on of
-                    ("home", "back", "left", "right", "up", "down", "center",
-                    "search", "enter", "delete", "del", "recent", "volume_up",
-                    "menu", "volume_down", "volume_mute", "camera", "power")
-                """
-                obj.server.jsonrpc.registerPressKeyskWatcher(
-                    name, self.__selectors, keys)
-
-        return Watcher()
-
-    @property
-    def watchers(self):
-        obj = self
-
-        class Watchers(list):
-            def __init__(self):
-                for watcher in obj.server.jsonrpc.getWatchers():
-                    self.append(watcher)
-
-            @property
-            def triggered(self):
-                return obj.server.jsonrpc.hasAnyWatcherTriggered()
-
-            def remove(self, name=None):
-                if name:
-                    obj.server.jsonrpc.removeWatcher(name)
-                else:
-                    for name in self:
-                        obj.server.jsonrpc.removeWatcher(name)
-
-            def reset(self):
-                obj.server.jsonrpc.resetWatcherTriggers()
-                return self
-
-            def run(self):
-                obj.server.jsonrpc.runWatchers()
-                return self
-
-            @property
-            def watched(self):
-                return obj.server.jsonrpc.hasWatchedOnWindowsChange()
-
-            @watched.setter
-            def watched(self, b):
-                """
-                Args:
-                    b: boolean
-                """
-                assert isinstance(b, bool)
-                obj.server.jsonrpc.runWatchersOnWindowsChange(b)
-
-        return Watchers()
-
     @property
     def info(self):
         return self.jsonrpc.deviceInfo()
+
+    @property
+    def clipboard(self):
+        return self.jsonrpc.getClipboard()
+
+    def set_clipboard(self, text, label=None):
+        '''
+        Args:
+            text: The actual text in the clip.
+            label: User-visible label for the clip data.
+        '''
+        self.jsonrpc.setClipboard(label, text)
+
+    def __getattr__(self, key):
+        if key in [
+                "app_current",
+                "app_start",
+                "app_stop",
+                "app_stop_all",
+                "app_list",
+                "app_list_running",
+                "app_info",
+                "app_wait",
+                "wait_activity",
+                "wait_timeout",
+                "window_size",
+                "wlan_ip",
+                "widget", # plugin
+                "watcher", # plugin
+                "image", # plugin
+                "jsonrpc",
+                "open_identify",
+                "shell",
+                "set_new_command_timeout",
+                "settings", # plugin
+                "taobao", # plugin
+                "xpath", # plugin
+        ]:
+            return getattr(self.server, key)
+        raise AttributeError(f"Session object has no attribute '{key}'")
 
     def __call__(self, **kwargs):
         return UiObject(self, Selector(**kwargs))
